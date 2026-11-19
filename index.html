@@ -1,137 +1,122 @@
-let cachedToken = null;
-let tokenExpiresAt = 0;
-let cachedInverters = null; // { devIds, devTypeId }
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Production Solaire — SIDEC Jura</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: #0b1120;
+      color: #f8fafc;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+    header { text-align: center; margin-bottom: 2.5rem; }
+    h1 { font-size: clamp(1.5rem, 3vw, 2.2rem); font-weight: 700; margin-bottom: 0.5rem; }
+    .subtitle { color: #94a3b8; font-size: 1rem; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1.5rem;
+      width: 100%;
+      max-width: 900px;
+    }
+    .card {
+      background-color: #162033;
+      border: 1px solid #26334d;
+      border-radius: 12px;
+      padding: 2rem 1.5rem;
+      text-align: center;
+    }
+    .card-title {
+      color: #94a3b8;
+      font-size: 0.85rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 1.25rem;
+    }
+    .card-value { font-size: clamp(2rem, 4vw, 2.8rem); font-weight: 700; }
+    .unit { font-size: 1.1rem; font-weight: 500; color: #cbd5e1; margin-left: 0.3rem; }
+    .power { color: #f59e0b; }
+    .energy { color: #10b981; }
+    footer { margin-top: 2.5rem; text-align: center; font-size: 0.9rem; color: #94a3b8; }
+    .error { color: #ef4444; margin-top: 0.75rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Production Photovoltaïque — SIDEC</h1>
+    <p class="subtitle">Suivi en direct de l'installation solaire</p>
+  </header>
 
-async function getXsrfToken(baseUrl, userName, systemCode, forceRefresh = false) {
-  if (!forceRefresh && cachedToken && Date.now() < tokenExpiresAt) {
-    return cachedToken;
-  }
+  <main class="grid">
+    <div class="card">
+      <div class="card-title">Puissance instantanée</div>
+      <div class="card-value"><span id="power" class="power">--</span><span class="unit">kW</span></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Production du jour</div>
+      <div class="card-value"><span id="day" class="energy">--</span><span class="unit">kWh</span></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Production totale</div>
+      <div class="card-value"><span id="total" class="energy">--</span><span class="unit">MWh</span></div>
+    </div>
+  </main>
 
-  const loginRes = await fetch(`${baseUrl}/thirdData/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ userName, systemCode })
-  });
+  <footer>
+    <p id="status">Chargement des données...</p>
+    <p id="error" class="error"></p>
+  </footer>
 
-  const xsrfToken = loginRes.headers.get('xsrf-token');
-  const loginData = await loginRes.json();
+  <script>
+    const CACHE_KEY = 'sidec_solar_last_data';
 
-  if (!loginData.success || !xsrfToken) {
-    const err = new Error(loginData.data || loginData.message || 'Échec de connexion FusionSolar');
-    err.detail = loginData;
-    throw err;
-  }
+    function renderData(data, isCached = false) {
+      document.getElementById('power').textContent =
+        data.activePowerKw !== null ? data.activePowerKw.toLocaleString('fr-FR') : '--';
+      document.getElementById('day').textContent =
+        data.dayPowerKwh.toLocaleString('fr-FR');
+      document.getElementById('total').textContent =
+        (data.totalPowerKwh / 1000).toLocaleString('fr-FR', { maximumFractionDigits: 2 });
 
-  cachedToken = xsrfToken;
-  tokenExpiresAt = Date.now() + 25 * 60 * 1000;
-  return cachedToken;
-}
-
-export default async function handler(req, res) {
-  const BASE_URL = 'https://eu5.fusionsolar.huawei.com';
-  const userName = (process.env.FS_USER || '').trim();
-  const systemCode = (process.env.FS_PASS || '').trim();
-  const stationCode = (process.env.STATION_CODE || '').trim();
-
-  if (!userName || !systemCode || !stationCode) {
-    return res.status(500).json({ error: 'Variables d’environnement manquantes sur Vercel.' });
-  }
-
-  try {
-    let xsrfToken = await getXsrfToken(BASE_URL, userName, systemCode);
-
-    const callHuawei = async (endpoint, payload) => {
-      let response = await fetch(`${BASE_URL}${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'XSRF-TOKEN': xsrfToken },
-        body: JSON.stringify(payload)
-      });
-      let json = await response.json();
-
-      if (json.failCode === 305) {
-        xsrfToken = await getXsrfToken(BASE_URL, userName, systemCode, true);
-        response = await fetch(`${BASE_URL}${endpoint}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'XSRF-TOKEN': xsrfToken },
-          body: JSON.stringify(payload)
-        });
-        json = await response.json();
-      }
-      return json;
-    };
-
-    // 1. KPI de la centrale
-    const kpiJson = await callHuawei('/thirdData/getStationRealKpi', {
-      stationCodes: stationCode
-    });
-
-    if (!kpiJson.success || !Array.isArray(kpiJson.data) || kpiJson.data.length === 0) {
-      return res.status(400).json({
-        error: `Aucune donnée reçue pour ${stationCode}`,
-        detail: kpiJson
-      });
+      const date = new Date(data.updatedAt);
+      const suffix = isCached ? ' (données mémorisées)' : '';
+      document.getElementById('status').textContent =
+        `Dernière mise à jour : ${date.toLocaleTimeString('fr-FR')}${suffix}`;
     }
 
-    const stationMap = kpiJson.data[0].dataItemMap || {};
-    let powerDebug = null;
+    async function refreshData() {
+      const errorEl = document.getElementById('error');
+      errorEl.textContent = '';
 
-    // 2. Récupération des IDs onduleurs (devTypeId = 1 ou 38)
-    if (!cachedInverters) {
-      const devListJson = await callHuawei('/thirdData/getDevList', {
-        stationCodes: stationCode
-      });
+      const saved = localStorage.getItem(CACHE_KEY);
+      if (saved) {
+        try { renderData(JSON.parse(saved), true); } catch (e) {}
+      }
 
-      if (devListJson.success && Array.isArray(devListJson.data)) {
-        const inverters = devListJson.data.filter(
-          (d) => d.devTypeId === 1 || d.devTypeId === 38
-        );
-        if (inverters.length > 0) {
-          cachedInverters = {
-            devIds: inverters.map((d) => d.id).join(','),
-            devTypeId: inverters[0].devTypeId
-          };
-        } else {
-          powerDebug = { step: 'getDevList', devices: devListJson.data };
+      try {
+        const res = await fetch('/api/production');
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Erreur de récupération');
+
+        localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+        renderData(data, false);
+      } catch (err) {
+        if (!saved) {
+          errorEl.textContent = `En attente des données FusionSolar (${err.message})`;
         }
-      } else {
-        powerDebug = { step: 'getDevList', response: devListJson };
       }
     }
 
-    // 3. Puissance instantanée des onduleurs
-    let activePowerKw = null;
-    if (cachedInverters) {
-      const devKpiJson = await callHuawei('/thirdData/getDevRealKpi', {
-        devIds: cachedInverters.devIds,
-        devTypeId: cachedInverters.devTypeId
-      });
-
-      if (devKpiJson.success && Array.isArray(devKpiJson.data)) {
-        activePowerKw = devKpiJson.data.reduce(
-          (sum, item) => sum + (Number(item?.dataItemMap?.active_power) || 0),
-          0
-        );
-      } else {
-        powerDebug = { step: 'getDevRealKpi', response: devKpiJson };
-      }
-    }
-
-    // Cache de 5 min si complet, sinon 30 s pour réessayer rapidement
-    const cacheSeconds = activePowerKw !== null ? 300 : 30;
-    res.setHeader('Cache-Control', `s-maxage=${cacheSeconds}, stale-while-revalidate=60`);
-
-    return res.status(200).json({
-      activePowerKw: activePowerKw !== null ? Number(activePowerKw.toFixed(2)) : null,
-      dayPowerKwh: Number((stationMap.day_power || 0).toFixed(2)),
-      monthPowerKwh: Number((stationMap.month_power || 0).toFixed(1)),
-      totalPowerKwh: Number((stationMap.total_power || 0).toFixed(1)),
-      updatedAt: new Date().toISOString(),
-      ...(powerDebug ? { powerDebug } : {})
-    });
-  } catch (err) {
-    return res.status(502).json({
-      error: err.message || 'Erreur serveur',
-      detail: err.detail || null
-    });
-  }
-}
+    refreshData();
+    setInterval(refreshData, 300000);
+  </script>
+</body>
+</html>
