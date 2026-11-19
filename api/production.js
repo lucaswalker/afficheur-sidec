@@ -1,3 +1,31 @@
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
+async function getXsrfToken(baseUrl, userName, systemCode, forceRefresh = false) {
+  if (!forceRefresh && cachedToken && Date.now() < tokenExpiresAt) {
+    return cachedToken;
+  }
+
+  const loginRes = await fetch(`${baseUrl}/thirdData/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ userName, systemCode })
+  });
+
+  const xsrfToken = loginRes.headers.get('xsrf-token');
+  const loginData = await loginRes.json();
+
+  if (!loginData.success || !xsrfToken) {
+    const err = new Error(loginData.data || loginData.message || 'Échec de connexion FusionSolar');
+    err.detail = loginData;
+    throw err;
+  }
+
+  cachedToken = xsrfToken;
+  tokenExpiresAt = Date.now() + 25 * 60 * 1000; // Jeton valide ~30 min chez Huawei
+  return cachedToken;
+}
+
 export default async function handler(req, res) {
   const BASE_URL = 'https://eu5.fusionsolar.huawei.com';
   const userName = (process.env.FS_USER || '').trim();
@@ -9,80 +37,64 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 1. Authentification
-    const loginRes = await fetch(`${BASE_URL}/thirdData/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userName, systemCode })
-    });
+    let xsrfToken = await getXsrfToken(BASE_URL, userName, systemCode);
 
-    const xsrfToken = loginRes.headers.get('xsrf-token');
-    const loginData = await loginRes.json();
-
-    if (!loginData.success || !xsrfToken) {
-      return res.status(401).json({
-        error: 'Échec de connexion FusionSolar',
-        detail: loginData
+    const callHuawei = async (endpoint, payload) => {
+      let response = await fetch(`${BASE_URL}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'XSRF-TOKEN': xsrfToken },
+        body: JSON.stringify(payload)
       });
-    }
+      let json = await response.json();
 
-    const authHeaders = {
-      'Content-Type': 'application/json',
-      'XSRF-TOKEN': xsrfToken
+      // Si le jeton a expiré (failCode 305), on le renouvelle une fois
+      if (json.failCode === 305) {
+        xsrfToken = await getXsrfToken(BASE_URL, userName, systemCode, true);
+        response = await fetch(`${BASE_URL}${endpoint}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'XSRF-TOKEN': xsrfToken },
+          body: JSON.stringify(payload)
+        });
+        json = await response.json();
+      }
+      return json;
     };
 
-    // 2. Lecture des KPI de la centrale
-    const kpiRes = await fetch(`${BASE_URL}/thirdData/getStationRealKpi`, {
-      method: 'POST',
-      headers: authHeaders,
-      body: JSON.stringify({ stationCodes: stationCode })
+    // 1. KPI de la centrale
+    const kpiJson = await callHuawei('/thirdData/getStationRealKpi', {
+      stationCodes: stationCode
     });
-    const kpiJson = await kpiRes.json();
 
-    // Si Huawei renvoie une erreur (ex: centrale non associée ou droit manquant)
     if (!kpiJson.success || !kpiJson.data || kpiJson.data.length === 0) {
-      // On interroge getStationList pour voir quelles centrales sont autorisées sur ce compte
-      const listRes = await fetch(`${BASE_URL}/thirdData/getStationList`, {
-        method: 'POST',
-        headers: authHeaders,
-        body: JSON.stringify({})
-      });
-      const listJson = await listRes.json();
-
       return res.status(400).json({
         error: `Aucune donnée reçue pour ${stationCode}`,
-        huaweiKpiResponse: kpiJson,
-        centralesAutoriseesSurCeCompte: listJson
+        detail: kpiJson
       });
     }
 
     const stationMap = kpiJson.data[0].dataItemMap || {};
 
-    // 3. Lecture de la puissance instantanée (onduleur devTypeId = 1)
+    // 2. Puissance instantanée des onduleurs (devTypeId = 1)
     let activePowerKw = null;
-    const devListRes = await fetch(`${BASE_URL}/thirdData/getDevList`, {
-      method: 'POST',
-      headers: authHeaders,
-      body: JSON.stringify({ stationCodes: stationCode })
+    const devListJson = await callHuawei('/thirdData/getDevList', {
+      stationCodes: stationCode
     });
-    const devListJson = await devListRes.json();
     const inverters = (devListJson?.data || []).filter((d) => d.devTypeId === 1);
 
     if (inverters.length > 0) {
       const devIds = inverters.map((d) => d.id).join(',');
-      const devKpiRes = await fetch(`${BASE_URL}/thirdData/getDevRealKpi`, {
-        method: 'POST',
-        headers: authHeaders,
-        body: JSON.stringify({ devIds, devTypeId: 1 })
+      const devKpiJson = await callHuawei('/thirdData/getDevRealKpi', {
+        devIds,
+        devTypeId: 1
       });
-      const devKpiJson = await devKpiRes.json();
       activePowerKw = (devKpiJson?.data || []).reduce(
         (sum, item) => sum + (Number(item?.dataItemMap?.active_power) || 0),
         0
       );
     }
 
-    res.setHeader('Cache-Control', 'no-store');
+    // Cache Vercel de 5 minutes (protège contre l'erreur 407)
+    res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=60');
 
     return res.status(200).json({
       activePowerKw: activePowerKw !== null ? Number(activePowerKw.toFixed(2)) : null,
@@ -92,6 +104,9 @@ export default async function handler(req, res) {
       updatedAt: new Date().toISOString()
     });
   } catch (err) {
-    return res.status(500).json({ error: 'Erreur serveur', detail: err.message });
+    return res.status(502).json({
+      error: err.message || 'Erreur serveur',
+      detail: err.detail || null
+    });
   }
 }
