@@ -1,5 +1,6 @@
 let cachedToken = null;
 let tokenExpiresAt = 0;
+let cachedDevIds = null;
 
 async function getXsrfToken(baseUrl, userName, systemCode, forceRefresh = false) {
   if (!forceRefresh && cachedToken && Date.now() < tokenExpiresAt) {
@@ -22,7 +23,7 @@ async function getXsrfToken(baseUrl, userName, systemCode, forceRefresh = false)
   }
 
   cachedToken = xsrfToken;
-  tokenExpiresAt = Date.now() + 25 * 60 * 1000; // Jeton valide ~30 min chez Huawei
+  tokenExpiresAt = Date.now() + 25 * 60 * 1000;
   return cachedToken;
 }
 
@@ -47,7 +48,6 @@ export default async function handler(req, res) {
       });
       let json = await response.json();
 
-      // Si le jeton a expiré (failCode 305), on le renouvelle une fois
       if (json.failCode === 305) {
         xsrfToken = await getXsrfToken(BASE_URL, userName, systemCode, true);
         response = await fetch(`${BASE_URL}${endpoint}`, {
@@ -65,7 +65,7 @@ export default async function handler(req, res) {
       stationCodes: stationCode
     });
 
-    if (!kpiJson.success || !kpiJson.data || kpiJson.data.length === 0) {
+    if (!kpiJson.success || !Array.isArray(kpiJson.data) || kpiJson.data.length === 0) {
       return res.status(400).json({
         error: `Aucune donnée reçue pour ${stationCode}`,
         detail: kpiJson
@@ -74,23 +74,32 @@ export default async function handler(req, res) {
 
     const stationMap = kpiJson.data[0].dataItemMap || {};
 
-    // 2. Puissance instantanée des onduleurs (devTypeId = 1)
-    let activePowerKw = null;
-    const devListJson = await callHuawei('/thirdData/getDevList', {
-      stationCodes: stationCode
-    });
-    const inverters = (devListJson?.data || []).filter((d) => d.devTypeId === 1);
+    // 2. Récupération (et mise en cache) des IDs onduleurs (devTypeId = 1)
+    if (!cachedDevIds) {
+      const devListJson = await callHuawei('/thirdData/getDevList', {
+        stationCodes: stationCode
+      });
+      if (devListJson.success && Array.isArray(devListJson.data)) {
+        const inverters = devListJson.data.filter((d) => d.devTypeId === 1);
+        if (inverters.length > 0) {
+          cachedDevIds = inverters.map((d) => d.id).join(',');
+        }
+      }
+    }
 
-    if (inverters.length > 0) {
-      const devIds = inverters.map((d) => d.id).join(',');
+    // 3. Puissance instantanée des onduleurs
+    let activePowerKw = null;
+    if (cachedDevIds) {
       const devKpiJson = await callHuawei('/thirdData/getDevRealKpi', {
-        devIds,
+        devIds: cachedDevIds,
         devTypeId: 1
       });
-      activePowerKw = (devKpiJson?.data || []).reduce(
-        (sum, item) => sum + (Number(item?.dataItemMap?.active_power) || 0),
-        0
-      );
+      if (devKpiJson.success && Array.isArray(devKpiJson.data)) {
+        activePowerKw = devKpiJson.data.reduce(
+          (sum, item) => sum + (Number(item?.dataItemMap?.active_power) || 0),
+          0
+        );
+      }
     }
 
     // Cache Vercel de 5 minutes (protège contre l'erreur 407)
