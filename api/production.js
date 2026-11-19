@@ -1,6 +1,6 @@
 let cachedToken = null;
 let tokenExpiresAt = 0;
-let cachedDevIds = null;
+let cachedInverters = null; // { devIds, devTypeId }
 
 async function getXsrfToken(baseUrl, userName, systemCode, forceRefresh = false) {
   if (!forceRefresh && cachedToken && Date.now() < tokenExpiresAt) {
@@ -73,44 +73,60 @@ export default async function handler(req, res) {
     }
 
     const stationMap = kpiJson.data[0].dataItemMap || {};
+    let powerDebug = null;
 
-    // 2. Récupération (et mise en cache) des IDs onduleurs (devTypeId = 1)
-    if (!cachedDevIds) {
+    // 2. Récupération des IDs onduleurs (devTypeId = 1 ou 38)
+    if (!cachedInverters) {
       const devListJson = await callHuawei('/thirdData/getDevList', {
         stationCodes: stationCode
       });
+
       if (devListJson.success && Array.isArray(devListJson.data)) {
-        const inverters = devListJson.data.filter((d) => d.devTypeId === 1);
+        const inverters = devListJson.data.filter(
+          (d) => d.devTypeId === 1 || d.devTypeId === 38
+        );
         if (inverters.length > 0) {
-          cachedDevIds = inverters.map((d) => d.id).join(',');
+          cachedInverters = {
+            devIds: inverters.map((d) => d.id).join(','),
+            devTypeId: inverters[0].devTypeId
+          };
+        } else {
+          powerDebug = { step: 'getDevList', devices: devListJson.data };
         }
+      } else {
+        powerDebug = { step: 'getDevList', response: devListJson };
       }
     }
 
     // 3. Puissance instantanée des onduleurs
     let activePowerKw = null;
-    if (cachedDevIds) {
+    if (cachedInverters) {
       const devKpiJson = await callHuawei('/thirdData/getDevRealKpi', {
-        devIds: cachedDevIds,
-        devTypeId: 1
+        devIds: cachedInverters.devIds,
+        devTypeId: cachedInverters.devTypeId
       });
+
       if (devKpiJson.success && Array.isArray(devKpiJson.data)) {
         activePowerKw = devKpiJson.data.reduce(
           (sum, item) => sum + (Number(item?.dataItemMap?.active_power) || 0),
           0
         );
+      } else {
+        powerDebug = { step: 'getDevRealKpi', response: devKpiJson };
       }
     }
 
-    // Cache Vercel de 5 minutes (protège contre l'erreur 407)
-    res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=60');
+    // Cache de 5 min si complet, sinon 30 s pour réessayer rapidement
+    const cacheSeconds = activePowerKw !== null ? 300 : 30;
+    res.setHeader('Cache-Control', `s-maxage=${cacheSeconds}, stale-while-revalidate=60`);
 
     return res.status(200).json({
       activePowerKw: activePowerKw !== null ? Number(activePowerKw.toFixed(2)) : null,
       dayPowerKwh: Number((stationMap.day_power || 0).toFixed(2)),
       monthPowerKwh: Number((stationMap.month_power || 0).toFixed(1)),
       totalPowerKwh: Number((stationMap.total_power || 0).toFixed(1)),
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      ...(powerDebug ? { powerDebug } : {})
     });
   } catch (err) {
     return res.status(502).json({
